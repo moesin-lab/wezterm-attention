@@ -39,6 +39,9 @@ local defaults = {
 
   -- Keybind to toggle "review" marker on active pane (false to disable)
   review_key = { key = "b", mods = "ALT" },
+
+  -- User var name watched for remote/SSH attention updates (false to disable)
+  user_var = "wezterm_attention",
 }
 
 -- Known attention types (reject unknown values from marker files)
@@ -68,6 +71,45 @@ end
 
 local function remove_marker(dir, pane_id)
   os.remove(dir .. "/" .. pane_id)
+end
+
+--- Write a marker file atomically: write <id>.tmp, then rename to <id>.
+local function write_marker(dir, pane_id, atype, frame)
+  os.execute("mkdir -p " .. dir)
+  local path = dir .. "/" .. pane_id
+  local f = io.open(path .. ".tmp", "w")
+  if not f then return false end
+  if frame then
+    f:write(string.format('{"type":"%s","frame":%d}', atype, frame))
+  else
+    f:write(string.format('{"type":"%s"}', atype))
+  end
+  f:close()
+  return os.rename(path .. ".tmp", path) ~= nil
+end
+
+--- Parse a user var value into (type, frame).
+--- Accepts plain strings ("stop", "clear", ...) or JSON ({"type":"thinking","frame":2}).
+--- Returns "clear" for clear requests, nil for anything invalid.
+local function parse_attention_value(value)
+  if type(value) ~= "string" then return nil end
+
+  if value:match("^%s*{") then
+    local ok, data = pcall(wezterm.json_parse, value)
+    if ok and type(data) == "table" then
+      if data.type == "clear" then return "clear", nil end
+      if valid_types[data.type] then
+        local frame = tonumber(data.frame)
+        return data.type, frame and math.floor(frame) or nil
+      end
+    end
+    return nil
+  end
+
+  local text = value:gsub("%s+", "")
+  if text == "clear" then return "clear", nil end
+  if valid_types[text] then return text, nil end
+  return nil
 end
 
 -- ── In-memory cache ─────────────────────────────────────────────────────────
@@ -291,6 +333,36 @@ function M.apply_to_config(config, opts)
     end)
   end
 
+  -- ── User var bridge: SSH/remote sessions ─────────────────────────────
+  -- Remote hooks can't write local marker files; they emit OSC 1337
+  -- SetUserVar instead and we translate it into a marker here.
+
+  local user_var = opts.user_var
+  if user_var == nil then user_var = defaults.user_var end
+
+  if user_var then
+    wezterm.on("user-var-changed", function(_window, pane, name, value)
+      if name ~= user_var then return end
+
+      local atype, frame = parse_attention_value(value)
+      if not atype then
+        wezterm.log_warn("wezterm-attention: ignoring invalid user var value: " .. tostring(value))
+        return
+      end
+
+      local id = tostring(pane:pane_id())
+      if atype == "clear" then
+        remove_marker(dir, id)
+        attention_cache[id] = nil
+        return
+      end
+
+      if write_marker(dir, id, atype, frame) then
+        attention_cache[id] = { type = atype, frame = frame }
+      end
+    end)
+  end
+
   -- ── Cleanup marker when pane closes ───────────────────────────────────
 
   wezterm.on("pane-destroyed", function(_window, pane)
@@ -351,20 +423,15 @@ function M.apply_to_config(config, opts)
       mods = review_key.mods,
       action = wezterm.action_callback(function(_win, pane)
         local id = tostring(pane:pane_id())
-        local path = dir .. "/" .. id
 
         local cached = attention_cache[id]
         if cached and cached.type == "review" then
-          os.remove(path)
+          remove_marker(dir, id)
           attention_cache[id] = nil
           return
         end
 
-        os.execute("mkdir -p " .. dir)
-        local w = io.open(path, "w")
-        if w then
-          w:write('{"type":"review"}')
-          w:close()
+        if write_marker(dir, id, "review") then
           attention_cache[id] = { type = "review" }
         end
       end),

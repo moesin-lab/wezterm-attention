@@ -103,12 +103,15 @@ attention.apply_to_config(config, {
   -- Review toggle keybind (false to disable)
   review_key = { key = "b", mods = "ALT" },
 
+  -- User var name watched for SSH/remote attention updates (false to disable)
+  user_var = "wezterm_attention",
+
 })
 ```
 
 ## The protocol
 
-Any process running inside WezTerm can write a marker. The contract is:
+Any **local** process running inside WezTerm can write a marker (for SSH/remote processes, use [user vars](#ssh--remote-sessions-user-vars) instead). The contract is:
 
 1. **Write** a JSON file to `~/.local/state/wezterm-attention/<WEZTERM_PANE>`
 2. **Contents:** `{"type":"<state>"}` where state is `thinking`, `stop`, `notify`, or `review`
@@ -154,6 +157,65 @@ const file = path.join(dir, process.env.WEZTERM_PANE);
 fs.writeFileSync(file + ".tmp", JSON.stringify({ type: "stop" }));
 fs.renameSync(file + ".tmp", file);
 ```
+
+## SSH / remote sessions (user vars)
+
+Marker files only work for processes running on the same machine as WezTerm. A hook running on an SSH host (or inside WSL) can't write to your local marker directory — instead, it should emit a [WezTerm user var](https://wezterm.org/recipes/passing-data.html) (iTerm2-style OSC 1337 `SetUserVar` escape). The plugin listens for `user-var-changed`, resolves the local pane ID itself, and writes the marker file locally. The escape sequence travels through SSH like any terminal output, so the remote side never needs to know your local paths.
+
+The watched variable name defaults to `wezterm_attention`; set `user_var = false` to disable the bridge, or pass a different name.
+
+Accepted values (base64-encoded inside the escape; WezTerm decodes before the plugin sees them):
+
+- Plain strings: `thinking`, `stop`, `notify`, `review`, `clear`
+- JSON: `{"type":"thinking","frame":2}` or `{"type":"clear"}`
+
+`clear` removes the pane's marker. Anything else is ignored (with a `wezterm.log_warn`).
+
+### Shell helper
+
+Put this in your remote `.bashrc`/`.zshrc` (or hook scripts). It handles base64 encoding and tmux passthrough wrapping:
+
+```bash
+wezterm_attention() {
+  local value="${1:-stop}"
+  if command -v base64 >/dev/null 2>&1; then
+    if [ -n "${TMUX:-}" ]; then
+      printf '\033Ptmux;\033\033]1337;SetUserVar=wezterm_attention=%s\007\033\\' \
+        "$(printf '%s' "$value" | base64 | tr -d '\n')" > /dev/tty 2>/dev/null || true
+    else
+      printf '\033]1337;SetUserVar=wezterm_attention=%s\007' \
+        "$(printf '%s' "$value" | base64 | tr -d '\n')" > /dev/tty 2>/dev/null || true
+    fi
+  fi
+}
+```
+
+If you run tmux inside the SSH session, tmux must be allowed to pass the escape through — add to your tmux config:
+
+```
+set -g allow-passthrough on
+```
+
+### Remote hook examples
+
+Use the helper from your agent hooks instead of writing marker files:
+
+| Hook event | Command |
+|------------|---------|
+| `Stop` | `wezterm_attention stop` |
+| `Notification` / `PermissionRequest` | `wezterm_attention notify` |
+| `PreToolUse` | `wezterm_attention thinking` — or JSON for spinner control: `wezterm_attention '{"type":"thinking","frame":0}'` |
+| `SessionEnd` | `wezterm_attention clear` |
+
+### Quick test
+
+From any SSH session inside WezTerm:
+
+```bash
+printf '\033]1337;SetUserVar=wezterm_attention=%s\007' "$(printf stop | base64 | tr -d '\n')" > /dev/tty
+```
+
+Switch to another tab — the source tab should show the mint ✓ indicator.
 
 ## Existing update-status handler?
 
@@ -330,6 +392,7 @@ No background threads, no FFI, no external dependencies — just filesystem read
 - Check file contents: `cat ~/.local/state/wezterm-attention/$WEZTERM_PANE` (should be valid JSON)
 - Ensure your hooks write to the same path as the plugin's `dir` setting
 - `status_update_interval` defaults to 1000ms; markers update on this interval
+- Over SSH? Marker files won't work remotely — send a [user var](#ssh--remote-sessions-user-vars) instead. Inside tmux, make sure `allow-passthrough` is on.
 
 **Tab titles look wrong?**
 - WezTerm only runs the **first** registered `format-tab-title` handler. If you have your own handler, set `renderer = "manual"` and use `wrap_title_formatter()` or the plugin API. Two handlers cannot coexist.
