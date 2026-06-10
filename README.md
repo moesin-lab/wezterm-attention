@@ -194,10 +194,10 @@ wezterm_attention() {
   if command -v base64 >/dev/null 2>&1; then
     if [ -n "${TMUX:-}" ]; then
       printf '\033Ptmux;\033\033]1337;SetUserVar=wezterm_attention=%s\007\033\\' \
-        "$(printf '%s' "$value" | base64 | tr -d '\n')" > /dev/tty 2>/dev/null || true
+        "$(printf '%s' "$value" | base64 | tr -d '\n')" 2>/dev/null > /dev/tty || true
     else
       printf '\033]1337;SetUserVar=wezterm_attention=%s\007' \
-        "$(printf '%s' "$value" | base64 | tr -d '\n')" > /dev/tty 2>/dev/null || true
+        "$(printf '%s' "$value" | base64 | tr -d '\n')" 2>/dev/null > /dev/tty || true
     fi
   fi
 }
@@ -217,8 +217,44 @@ Use the helper from your agent hooks instead of writing marker files:
 |------------|---------|
 | `Stop` | `wezterm_attention stop` |
 | `Notification` / `PermissionRequest` | `wezterm_attention notify` |
-| `PreToolUse` | `wezterm_attention thinking` — every event refreshes `thinking_ttl`, so firing it per tool call keeps the indicator alive |
+| `PreToolUse` / `PostToolUse` | `wezterm_attention thinking` — every event refreshes `thinking_ttl`, so firing it per tool call keeps the indicator alive |
 | `SessionEnd` | `wezterm_attention clear` |
+
+### Complete Claude Code bridge (with interrupt fallbacks)
+
+There is a lifecycle gap to be aware of: **Claude Code fires no hook at all when you interrupt a turn with Esc or a single Ctrl-C** — `Stop` only runs on normal completion. Without a fallback, an interrupted agent leaves the tab claiming `thinking` until `thinking_ttl` expires.
+
+[`examples/claude-code-hook.sh`](examples/claude-code-hook.sh) is a complete, drop-in bridge that closes the gap with three layers:
+
+1. **Idle notification** — ~60s after an interrupt, Claude Code sends a "waiting for your input" notification. The script remembers the last value it sent per session: if that was `thinking`, this is an interrupt leftover → send `clear`. A finished `stop` checkmark is left alone.
+2. **SessionEnd** — `/exit` or quitting the process clears a leftover `thinking` instantly (same state check, so a fresh ✓ survives).
+3. **The plugin's `thinking_ttl`** — last resort for `kill -9`, dropped SSH connections, and anything else that runs no code. With per-tool heartbeats you can lower it: `thinking_ttl = 120`.
+
+Save the script as `~/.claude/hooks/wezterm-attention.sh` and register it in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "sh ~/.claude/hooks/wezterm-attention.sh prompt-submit" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "sh ~/.claude/hooks/wezterm-attention.sh post-tool" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "sh ~/.claude/hooks/wezterm-attention.sh stop" }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "sh ~/.claude/hooks/wezterm-attention.sh notification" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "sh ~/.claude/hooks/wezterm-attention.sh session-end" }] }
+    ]
+  }
+}
+```
+
+The `PostToolUse` heartbeat does double duty: it keeps `thinking_ttl` refreshed during long runs, and every user var event makes WezTerm repaint the tab bar, so the spinner animates smoothly while tools are running.
 
 ### Quick test
 
@@ -288,12 +324,20 @@ Register hooks in `~/.claude/settings.json`:
 ```json
 {
   "hooks": {
-    "Stop": [{ "matcher": "", "hooks": ["/bin/bash ~/.claude/hooks/stop.sh"] }],
-    "PreToolUse": [{ "matcher": "", "hooks": ["/bin/bash ~/.claude/hooks/pre_tool_use.sh"] }],
-    "SessionEnd": [{ "matcher": "", "hooks": ["/bin/bash ~/.claude/hooks/session_end.sh"] }]
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "/bin/bash ~/.claude/hooks/stop.sh" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/bin/bash ~/.claude/hooks/pre_tool_use.sh" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "/bin/bash ~/.claude/hooks/session_end.sh" }] }
+    ]
   }
 }
 ```
+
+> **Lifecycle gap:** Claude Code fires **no hook** when you interrupt a turn with Esc/Ctrl-C — `Stop` only runs on normal completion, so an interrupted agent leaves `thinking` lit until `thinking_ttl` expires. See [the complete bridge with interrupt fallbacks](#complete-claude-code-bridge-with-interrupt-fallbacks) for how to close the gap using the idle notification and `SessionEnd`; the same state-file trick works with marker files too.
 
 **PreToolUse** — thinking indicator:
 ```typescript
