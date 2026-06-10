@@ -3,7 +3,7 @@
 -- Does NOT include: color theme, fonts, transparency, gradients — add your own
 
 local wezterm = require("wezterm")
-local attention = wezterm.plugin.require("https://github.com/pro-vi/wezterm-attention")
+local attention = wezterm.plugin.require("https://github.com/moesin-lab/wezterm-attention")
 local resurrect = wezterm.plugin.require("https://github.com/MLFlexer/resurrect.wezterm")
 
 local act = wezterm.action
@@ -11,7 +11,7 @@ local config = wezterm.config_builder()
 
 -- ── Attention plugin ────────────────────────────────────────────────────────
 -- Tab indicators for CLI tools (Claude Code, Codex, builds, scripts).
--- See: https://github.com/pro-vi/wezterm-attention
+-- See: https://github.com/moesin-lab/wezterm-attention
 
 attention.apply_to_config(config, { auto_poll = false })
 

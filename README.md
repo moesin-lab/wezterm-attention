@@ -20,7 +20,7 @@ When multiple panes in a tab have different states, the highest-priority one win
 Add one line to your `wezterm.lua`:
 
 ```lua
-local attention = wezterm.plugin.require("https://github.com/pro-vi/wezterm-attention")
+local attention = wezterm.plugin.require("https://github.com/moesin-lab/wezterm-attention")
 attention.apply_to_config(config)
 ```
 
@@ -244,7 +244,7 @@ end)
 The plugin exposes functions for use in your own WezTerm Lua code:
 
 ```lua
-local attention = wezterm.plugin.require("https://github.com/pro-vi/wezterm-attention")
+local attention = wezterm.plugin.require("https://github.com/moesin-lab/wezterm-attention")
 
 -- Read cached attention state: returns (type, frame) or nil
 local state, frame = attention.get_attention(pane:pane_id())
