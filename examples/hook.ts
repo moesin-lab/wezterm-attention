@@ -7,7 +7,9 @@
 // Protocol:
 //   Write {"type":"<state>"} to ~/.local/state/wezterm-attention/<WEZTERM_PANE>
 //   Valid types: "thinking", "stop", "notify", "review"
-//   Optional: {"type":"thinking","frame":0} for animated spinner (0-3)
+//   Optional: {"type":"thinking","frame":0} — bump frame on each write to keep
+//   the marker alive past the plugin's thinking_ttl. The spinner animation
+//   itself is time-driven by the plugin; frame is just a heartbeat nonce.
 //
 // The WEZTERM_PANE env var is set automatically by WezTerm for every shell.
 
@@ -27,10 +29,12 @@ async function writeMarker(type: AttentionType, frame?: number): Promise<void> {
   const data: Record<string, unknown> = { type };
   if (frame !== undefined) data.frame = frame;
 
-  // Atomic write: tmp file + rename avoids partial reads
+  // Atomic write: unique tmp name + rename. A fixed tmp name would let
+  // concurrent writers trample each other's half-written files.
   const file = join(dir, paneId);
-  await writeFile(file + ".tmp", JSON.stringify(data));
-  await rename(file + ".tmp", file);
+  const tmp = `${file}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify(data));
+  await rename(tmp, file);
 }
 
 // Example: signal that work is done

@@ -11,7 +11,7 @@ A WezTerm plugin that turns your tab bar into a notification system. Any CLI too
 | `notify` | ! | Rose | Something needs your attention |
 | `review` | ◆ | Gold | Manually flagged for review |
 
-Inactive tabs light up when a background process writes a marker. Active tabs auto-clear `stop` and `notify` (you've seen it). `thinking` and `review` persist until explicitly removed.
+Inactive tabs light up when a background process writes a marker. Active tabs auto-clear `stop` and `notify` (you've seen it). `review` persists until explicitly removed. `thinking` persists while the writer keeps refreshing it, and expires after `thinking_ttl` (default 10 minutes) without a refresh — so a crashed agent doesn't leave a tab claiming "working" forever.
 
 When multiple panes in a tab have different states, the highest-priority one wins: **notify > stop > review > thinking**.
 
@@ -26,11 +26,11 @@ attention.apply_to_config(config)
 
 By default, the plugin owns tab title formatting (`dir / title` + attention indicators). It also registers pane cleanup, a marker poller, and an `Alt+B` keybind to toggle review mode.
 
-> **Important:** WezTerm only runs the **first** registered `format-tab-title` handler. If another plugin (e.g. tabline.wez) registers one before this plugin, all attention features — indicators, colors, and auto-clear — are disabled. Make sure `apply_to_config` runs before any other plugin that touches tab titles, or use `renderer = "manual"` to integrate via the API instead.
+> **Important:** WezTerm only runs the **first** registered `format-tab-title` handler. If another plugin (e.g. tabline.wez) registers one before this plugin, the visual output — indicators, colors, title formatting — is disabled. The poller, auto-clear, TTL expiry and user var bridge keep working (they don't live in the render path). Make sure `apply_to_config` runs before any other plugin that touches tab titles, or use `renderer = "manual"` to integrate via the API instead.
 
 ## Render modes
 
-The plugin supports three render modes:
+The plugin supports two render modes:
 
 | Mode | Who owns `format-tab-title` | Per-tab colors | Use when |
 |------|---------------------------|----------------|----------|
@@ -106,6 +106,10 @@ attention.apply_to_config(config, {
   -- User var name watched for SSH/remote attention updates (false to disable)
   user_var = "wezterm_attention",
 
+  -- Seconds without a refresh before a "thinking" marker is considered
+  -- abandoned and dropped (false to disable)
+  thinking_ttl = 600,
+
 })
 ```
 
@@ -115,19 +119,21 @@ Any **local** process running inside WezTerm can write a marker (for SSH/remote 
 
 1. **Write** a JSON file to `~/.local/state/wezterm-attention/<WEZTERM_PANE>`
 2. **Contents:** `{"type":"<state>"}` where state is `thinking`, `stop`, `notify`, or `review`
-3. **Optional:** `{"type":"thinking","frame":0}` — `frame` (0-3) controls the spinner position
-4. **Cleanup** is automatic — markers are removed when panes close or tabs become active
+3. **Optional heartbeat:** `{"type":"thinking","frame":0}` — rewrite the marker with a changing `frame` (or any changing field) to keep a `thinking` marker alive past `thinking_ttl`. The spinner animation itself is time-driven by the plugin; `frame` no longer controls it.
+4. **Cleanup** is automatic — markers whose pane no longer exists are reaped on the first poll and periodically after that (~30 poll ticks; wezterm has no pane-destroyed event), `auto_clear` types clear when their tab is viewed in a focused window, and `thinking` expires when it stops being refreshed (`thinking_ttl`).
 
 The `WEZTERM_PANE` environment variable is injected by WezTerm into every shell it spawns. That's the pane's unique ID.
 
-**Atomic writes recommended:** To avoid partial reads, write to a `.tmp` file then rename:
+The state is last-write-wins: writers just declare the pane's current state. The plugin owns everything else — animation, expiry, cleanup. If a marker's content is ever caught mid-write, the plugin keeps the previous state instead of flickering it off.
+
+**Atomic writes recommended:** write to a tmp file with a **unique name** (include your PID — a fixed `.tmp` name lets concurrent writers trample each other), then rename:
 
 ### Shell (one-liner)
 
 ```bash
 MARKER_DIR="$HOME/.local/state/wezterm-attention"
 mkdir -p "$MARKER_DIR"
-echo '{"type":"stop"}' > "$MARKER_DIR/$WEZTERM_PANE.tmp" && mv "$MARKER_DIR/$WEZTERM_PANE.tmp" "$MARKER_DIR/$WEZTERM_PANE"
+echo '{"type":"stop"}' > "$MARKER_DIR/$WEZTERM_PANE.$$.tmp" && mv "$MARKER_DIR/$WEZTERM_PANE.$$.tmp" "$MARKER_DIR/$WEZTERM_PANE"
 ```
 
 ### TypeScript / Bun
@@ -140,8 +146,9 @@ const dir = join(process.env.HOME!, ".local", "state", "wezterm-attention");
 await mkdir(dir, { recursive: true });
 
 const file = join(dir, process.env.WEZTERM_PANE!);
-await writeFile(file + ".tmp", JSON.stringify({ type: "stop" }));
-await rename(file + ".tmp", file);
+const tmp = `${file}.${process.pid}.tmp`;
+await writeFile(tmp, JSON.stringify({ type: "stop" }));
+await rename(tmp, file);
 ```
 
 ### Node.js
@@ -154,8 +161,9 @@ const dir = path.join(process.env.HOME, ".local", "state", "wezterm-attention");
 fs.mkdirSync(dir, { recursive: true });
 
 const file = path.join(dir, process.env.WEZTERM_PANE);
-fs.writeFileSync(file + ".tmp", JSON.stringify({ type: "stop" }));
-fs.renameSync(file + ".tmp", file);
+const tmp = `${file}.${process.pid}.tmp`;
+fs.writeFileSync(tmp, JSON.stringify({ type: "stop" }));
+fs.renameSync(tmp, file);
 ```
 
 ## SSH / remote sessions (user vars)
@@ -169,7 +177,7 @@ Accepted values (base64-encoded inside the escape; WezTerm decodes before the pl
 - Plain strings: `thinking`, `stop`, `notify`, `review`, `clear`
 - JSON: `{"type":"thinking","frame":2}` or `{"type":"clear"}`
 
-`clear` removes the pane's marker. Anything else is ignored (with a `wezterm.log_warn`).
+`clear` removes the pane's marker. Anything else is ignored (with a `wezterm.log_warn`). Every received event counts as a refresh for `thinking_ttl`, even with identical values — so a remote agent just re-sends `thinking` periodically to stay alive.
 
 ### Shell helper
 
@@ -204,7 +212,7 @@ Use the helper from your agent hooks instead of writing marker files:
 |------------|---------|
 | `Stop` | `wezterm_attention stop` |
 | `Notification` / `PermissionRequest` | `wezterm_attention notify` |
-| `PreToolUse` | `wezterm_attention thinking` — or JSON for spinner control: `wezterm_attention '{"type":"thinking","frame":0}'` |
+| `PreToolUse` | `wezterm_attention thinking` — every event refreshes `thinking_ttl`, so firing it per tool call keeps the indicator alive |
 | `SessionEnd` | `wezterm_attention clear` |
 
 ### Quick test
@@ -282,22 +290,18 @@ Register hooks in `~/.claude/settings.json`:
 }
 ```
 
-**PreToolUse** — animated thinking spinner:
+**PreToolUse** — thinking indicator:
 ```typescript
 if (process.env.WEZTERM_PANE) {
-  const { mkdirSync, writeFileSync, readFileSync, renameSync } = require('fs');
+  const { mkdirSync, writeFileSync, renameSync } = require('fs');
   const markerDir = `${process.env.HOME}/.local/state/wezterm-attention`;
   const markerFile = `${markerDir}/${process.env.WEZTERM_PANE}`;
-
-  let frame = 0;
-  try {
-    const data = JSON.parse(readFileSync(markerFile, 'utf8'));
-    if (data.type === 'thinking') frame = ((data.frame || 0) + 1) % 4;
-  } catch {}
-
   mkdirSync(markerDir, { recursive: true });
-  writeFileSync(markerFile + '.tmp', JSON.stringify({ type: 'thinking', frame }));
-  renameSync(markerFile + '.tmp', markerFile);
+  // frame is just a heartbeat nonce — each change refreshes thinking_ttl.
+  // The spinner animation itself is time-driven by the plugin.
+  const tmp = `${markerFile}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ type: 'thinking', frame: Date.now() % 1000 }));
+  renameSync(tmp, markerFile);
 }
 ```
 
@@ -308,8 +312,9 @@ if (process.env.WEZTERM_PANE) {
   const markerDir = `${process.env.HOME}/.local/state/wezterm-attention`;
   const markerFile = `${markerDir}/${process.env.WEZTERM_PANE}`;
   mkdirSync(markerDir, { recursive: true });
-  writeFileSync(markerFile + '.tmp', JSON.stringify({ type: 'stop' }));
-  renameSync(markerFile + '.tmp', markerFile);
+  const tmp = `${markerFile}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ type: 'stop' }));
+  renameSync(tmp, markerFile);
 }
 ```
 
@@ -320,8 +325,9 @@ if (process.env.WEZTERM_PANE) {
   const markerDir = `${process.env.HOME}/.local/state/wezterm-attention`;
   const markerFile = `${markerDir}/${process.env.WEZTERM_PANE}`;
   mkdirSync(markerDir, { recursive: true });
-  writeFileSync(markerFile + '.tmp', JSON.stringify({ type: 'notify' }));
-  renameSync(markerFile + '.tmp', markerFile);
+  const tmp = `${markerFile}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ type: 'notify' }));
+  renameSync(tmp, markerFile);
 }
 ```
 
@@ -335,7 +341,7 @@ if (process.env.WEZTERM_PANE) {
 }
 ```
 
-> **Tip:** Add `` execSync(`wezterm cli set-window-title --pane-id ${process.env.WEZTERM_PANE} " "`) `` after writing a marker to force an immediate tab redraw instead of waiting for the next poll cycle.
+> **Latency note:** Marker files are picked up on the next poll tick (`status_update_interval`, default 1000ms) — forcing a redraw doesn't help, because the renderer only reads the in-memory cache that the poller fills. If you need event-level immediacy, use the [user var bridge](#ssh--remote-sessions-user-vars): it updates the cache the moment the event arrives.
 
 ## Codex hooks
 
@@ -347,12 +353,16 @@ async function writeWezTermMarker(type: "stop" | "notify"): Promise<void> {
   const home = process.env.HOME;
   if (!paneId || !home) return;
 
-  const { mkdir, writeFile } = require("node:fs/promises");
+  const { mkdir, writeFile, rename } = require("node:fs/promises");
   const { join } = require("node:path");
 
   const markerDir = join(home, ".local", "state", "wezterm-attention");
   await mkdir(markerDir, { recursive: true });
-  await writeFile(join(markerDir, paneId), JSON.stringify({ type }));
+
+  const file = join(markerDir, paneId);
+  const tmp = `${file}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify({ type }));
+  await rename(tmp, file);
 }
 
 // In your notify handler:
@@ -379,8 +389,10 @@ notify = ["bun", "/path/to/your/notify.ts"]
 
 The plugin uses a **poller/renderer split** to avoid blocking WezTerm's GUI thread:
 
-1. **Poller** (`update-status` event) — runs on WezTerm's `config.status_update_interval` (default 1000ms). Reads marker files from disk and updates an in-memory cache.
-2. **Renderer** (`format-tab-title` event) — fires on every tab repaint (mouse hover, key press, redraws). Reads only from the cache — zero I/O, instant returns.
+1. **Poller** (`update-status` event) — runs on WezTerm's `config.status_update_interval` (default 1000ms). Reads marker files from disk and updates an in-memory cache. This is the single place state transitions happen: picking up new markers, auto-clearing markers the user has actually seen (active tab **and** focused window), expiring stale `thinking` markers, tolerating partial writes (keeps the previous state for one tick, then drops corrupt files), and periodically reaping markers for panes that no longer exist.
+2. **Renderer** (`format-tab-title` event) — fires on every tab repaint (mouse hover, key press, redraws). Pure: reads only from the cache, mutates nothing — zero I/O, instant returns. The thinking spinner advances on wall-clock time, one frame per second.
+
+Marker writes are atomic (unique tmp name + rename) and portable — on Windows, where `rename()` can't replace an existing file, the plugin falls back to remove-then-rename. Startup cleanup is **live-aware**: the first poll reaps markers (and orphaned tmp files) whose pane doesn't exist, but never touches markers for live panes — so reconnecting to a long-lived mux server (`wezterm connect`) keeps valid state, and a user var arriving before the first poll isn't lost. The trade-off: after a fresh start, a leftover marker whose pane ID gets reused by the new session survives until auto-clear or TTL handles it (`stop`/`notify` clear on view, `thinking` expires, `review` can be toggled off with Alt+B).
 
 No background threads, no FFI, no external dependencies — just filesystem reads in Lua on a configurable interval.
 
@@ -397,6 +409,9 @@ No background threads, no FFI, no external dependencies — just filesystem read
 **Tab titles look wrong?**
 - WezTerm only runs the **first** registered `format-tab-title` handler. If you have your own handler, set `renderer = "manual"` and use `wrap_title_formatter()` or the plugin API. Two handlers cannot coexist.
 - Use `title_formatter` to customize the base title while keeping the plugin's indicators.
+
+**Thinking indicator disappeared while the agent is still working?**
+- `thinking` markers expire after `thinking_ttl` (default 600s) without a refresh. Make sure your hook fires repeatedly (e.g. on every `PreToolUse`) with changing content, or raise/disable the TTL.
 
 **Alt+B not working?**
 - Check for keybind conflicts. Set `review_key = false` and bind manually if needed.
