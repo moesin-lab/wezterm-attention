@@ -46,6 +46,14 @@ local defaults = {
   -- Seconds without a refresh before a "thinking" marker is considered
   -- abandoned (writer crashed) and dropped. false to disable.
   thinking_ttl = 600,
+
+  -- Drive tab bar repaints while attention state exists (false to disable).
+  -- WezTerm only recomputes tab titles when something it knows about changes
+  -- (right status content, user vars, mouse, tab switches) — cache-internal
+  -- transitions like spinner frames, TTL expiry and auto-clear are invisible
+  -- to it. poll() flips a zero-width character through set_right_status to
+  -- force the recompute; visually a no-op.
+  drive_repaint = true,
 }
 
 -- Known attention types (reject unknown values from marker files / user vars)
@@ -317,6 +325,8 @@ end
 --- periodic reaper below (wezterm has no pane-destroyed event).
 local poll_count = 0
 local REAP_EVERY = 30
+local repaint_flip = false
+local had_state = false
 
 function M.poll(window, opts)
   local dir = (opts and opts.dir) or M._active_dir or defaults.dir
@@ -389,6 +399,23 @@ function M.poll(window, opts)
     -- first poll doubles as startup cleanup (see reap); poll_count resets on
     -- config reload, so reloads get an extra (harmless) reap too
     reap(dir)
+  end
+
+  -- Drive a repaint while any attention state exists (and once more on the
+  -- tick it goes away, so the cleared indicator actually disappears).
+  -- Alternating zero-width content defeats wezterm's "status unchanged, skip
+  -- repaint" check. See defaults.drive_repaint.
+  local drive = M._active_drive_repaint
+  if drive == nil then drive = defaults.drive_repaint end
+  if drive then
+    local has_state = next(attention_cache) ~= nil
+    if has_state or had_state then
+      repaint_flip = not repaint_flip
+      pcall(function()
+        window:set_right_status(repaint_flip and "\u{200B}" or "")
+      end)
+    end
+    had_state = has_state
   end
 end
 
@@ -479,6 +506,10 @@ function M.apply_to_config(config, opts)
   local thinking_ttl = opts.thinking_ttl
   if thinking_ttl == nil then thinking_ttl = defaults.thinking_ttl end
   M._active_thinking_ttl = thinking_ttl
+
+  local drive_repaint = opts.drive_repaint
+  if drive_repaint == nil then drive_repaint = defaults.drive_repaint end
+  M._active_drive_repaint = drive_repaint
 
   -- Build lookup tables
   local clear_set = {}

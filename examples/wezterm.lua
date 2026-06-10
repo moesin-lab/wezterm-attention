@@ -157,7 +157,9 @@ end
 -- ── Git status bar ──────────────────────────────────────────────────────────
 -- Right status: branch +N/-N ?N ↑N | battery | time
 
-config.status_update_interval = 5000
+-- 1000ms: attention spinner frames, TTL expiry and auto-clear all advance on
+-- this tick. The git commands below have their own 5s throttle (git_cache.last).
+config.status_update_interval = 1000
 
 local git_cache = { cwd = "", diff = "", branch = "", untracked = 0, ahead = 0, is_repo = false, last = 0 }
 

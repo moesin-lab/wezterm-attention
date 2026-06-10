@@ -110,6 +110,11 @@ attention.apply_to_config(config, {
   -- abandoned and dropped (false to disable)
   thinking_ttl = 600,
 
+  -- Drive tab bar repaints while attention state exists (false to disable;
+  -- see "How it works" — without this, spinner frames and indicator
+  -- clearing are invisible until something else repaints the tab bar)
+  drive_repaint = true,
+
 })
 ```
 
@@ -392,6 +397,8 @@ The plugin uses a **poller/renderer split** to avoid blocking WezTerm's GUI thre
 1. **Poller** (`update-status` event) — runs on WezTerm's `config.status_update_interval` (default 1000ms). Reads marker files from disk and updates an in-memory cache. This is the single place state transitions happen: picking up new markers, auto-clearing markers the user has actually seen (active tab **and** focused window), expiring stale `thinking` markers, tolerating partial writes (keeps the previous state for one tick, then drops corrupt files), and periodically reaping markers for panes that no longer exist.
 2. **Renderer** (`format-tab-title` event) — fires on every tab repaint (mouse hover, key press, redraws). Pure: reads only from the cache, mutates nothing — zero I/O, instant returns. The thinking spinner advances on wall-clock time, one frame per second.
 
+WezTerm only recomputes tab titles when something it can observe changes — right-status content, user vars, mouse movement, tab switches. Cache-internal transitions (spinner frames, TTL expiry, auto-clear) are invisible to it, so the poller also **drives repaints**: while any attention state exists (plus one tick after it clears), it alternates a zero-width character through `window:set_right_status()`, which forces the tab bar to recompute. Visually a no-op; set `drive_repaint = false` if you manage `set_right_status` yourself and its content already changes every tick (e.g. a clock with seconds). Spinner frame rate and state-transition latency are both bounded by `config.status_update_interval` (default 1000ms).
+
 Marker writes are atomic (unique tmp name + rename) and portable — on Windows, where `rename()` can't replace an existing file, the plugin falls back to remove-then-rename. Startup cleanup is **live-aware**: the first poll reaps markers (and orphaned tmp files) whose pane doesn't exist, but never touches markers for live panes — so reconnecting to a long-lived mux server (`wezterm connect`) keeps valid state, and a user var arriving before the first poll isn't lost. The trade-off: after a fresh start, a leftover marker whose pane ID gets reused by the new session survives until auto-clear or TTL handles it (`stop`/`notify` clear on view, `thinking` expires, `review` can be toggled off with Alt+B).
 
 No background threads, no FFI, no external dependencies — just filesystem reads in Lua on a configurable interval.
@@ -409,6 +416,11 @@ No background threads, no FFI, no external dependencies — just filesystem read
 **Tab titles look wrong?**
 - WezTerm only runs the **first** registered `format-tab-title` handler. If you have your own handler, set `renderer = "manual"` and use `wrap_title_formatter()` or the plugin API. Two handlers cannot coexist.
 - Use `title_formatter` to customize the base title while keeping the plugin's indicators.
+
+**Spinner frozen, or indicators never clear (stuck `thinking` after killing an agent)?**
+- The state machine is fine — the tab bar just isn't repainting. Make sure you're on a plugin version with `drive_repaint` and that you haven't set it to `false` (only disable it if your own `update-status` handler writes changing content to `set_right_status` every tick).
+- A large `config.status_update_interval` slows everything down: spinner frames, TTL expiry and auto-clear all happen on the poll tick. Keep it at the default 1000ms.
+- A dead agent's `thinking` clears after `thinking_ttl` (default 600s). If your hooks send heartbeats more often (e.g. every 30s), you can lower it: `thinking_ttl = 120`.
 
 **Thinking indicator disappeared while the agent is still working?**
 - `thinking` markers expire after `thinking_ttl` (default 600s) without a refresh. Make sure your hook fires repeatedly (e.g. on every `PreToolUse`) with changing content, or raise/disable the TTL.
